@@ -17,6 +17,8 @@ import json
 import time
 import argparse
 import os
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -113,15 +115,23 @@ def margin_loss(logits, label_idx, targeted, device):
   other_max = logits[mask].view(n, -1).max(dim=1)[0]          # strongest other class
   chosen    = logits[:, label_idx]                            # the true / target class
   if targeted:
-    return other_max - chosen          # minimise → target becomes the argmax
+    return other_max - chosen          # minimise: target becomes the argmax
   else:
-    return chosen - other_max          # minimise → true class stops being argmax
+    return chosen - other_max          # minimise: true class stops being argmax
 
 
 # ── Single-image PGD attack ─────────────────────────────────────────────────
 #   PGD :  g = autograd.grad(loss, x): backpropagation
-def pgd_attack_one(x_np, target_np, model, targeted, device,
-                   epsilon, step_size, max_iter):
+def pgd_attack_one(x_np, target_np, model, targeted, device, epsilon, step_size, max_iter, solver='sgdsign'):
+  """Run PGD on one image; stops as soon as the attack succeeds so the query count reflects number of queries
+  to break the model, comparable to ZOO/NES early-stop.
+  x_np      : (C,H,W) numpy array in normalised space [-0.5, 0.5]
+  target_np : (num_classes,) one-hot:true class (untargeted) or target (targeted)
+  epsilon   : L-inf perturbation budget   
+  step_size : optimizer step size
+  solver    : which optimizer consumes the exact gradient (see PGD_SOLVERS)
+  """
+
   x0    = torch.from_numpy(x_np).unsqueeze(0).to(device)     
   adv   = x0.clone()
   lower = (x0 - epsilon).clamp(-0.5, 0.5)                     
@@ -133,20 +143,48 @@ def pgd_attack_one(x_np, target_np, model, targeted, device,
 
   loss_hist = []
   queries   = 0
+  state      = {} 
+  needs_hess = solver in CURVATURE_SOLVERS
+
 
   for step in range(max_iter):
     # exact gradient: backprop wrt the image, not the weights!
+    
+    # Curvature solvers need create_graph=True so the gradient can itself be
+    # differentiated again (second derivative is the Hessian-vector product).
+
     adv_var = adv.clone().detach().requires_grad_(True)       # track grad on the pixels
     logits  = model(adv_var)                              
-    loss    = margin_loss(logits, label_idx, targeted, device).sum()
-    grad,   = torch.autograd.grad(loss, adv_var)             
-    queries += 2
+    loss = margin_loss(logits, label_idx, targeted, device).sum()
+    grad,= torch.autograd.grad(loss, adv_var, create_graph = needs_hess)            
+    queries += 2 # backward step is one extra query
+
+    hvp_fn = None
+    if needs_hess:
+      # differentiate (grad dot v) again wrt the imagei via autograd
+      # Each call is one extra backward pass, each pass is one query!
+      def hvp_fn(v, _grad=grad, _var=adv_var):
+        Hv, = torch.autograd.grad(_grad, _var, grad_outputs=v,
+                                  retain_graph=True)
+        return Hv.detach()
+      # hutchinson_diag uses 3 probes! so 3 extra backward passes = + 3 queries
+      queries += 3
 
     loss_hist.append(float(loss.item()))
 
-
-    adv = adv - step_size * torch.sign(grad)  # L-inf PGD step
+    # original implemention version of below block:
+    # adv = adv - step_size * torch.sign(grad)  # L-inf PGD step
+    # adv = adv.clamp(lower, upper).detach() # project onto L-inf ball
+    
+    # solver_step() returns delta, an uphill-pointing update. it is built from the gradient, which points 
+    # toward incresing loss.. We want to minimise the margin loss to fool the model, so we move the image in the
+    # -delta direction (aka downhill). solver_step always returns a positive, uphill update, so the minus sign is applied here.
+    # Then clamp() projects the image back into the L-inf budgeti as usual for PGD.
+    grad_use = grad.detach() if needs_hess else grad
+    delta = solver_step(solver, grad_use, state, step_size,hvp_fn=hvp_fn) # chosen optimizer
+    adv = adv - delta
     adv = adv.clamp(lower, upper).detach() # project onto L-inf ball
+ 
 
     with torch.no_grad():
       pred = int(model(adv).argmax(dim=1).item())
@@ -173,6 +211,109 @@ def pgd_attack_one(x_np, target_np, model, targeted, device,
   dist_l2   = float(np.sqrt(np.sum((adv_np - x_np) ** 2)))    # L2 distortion
   return adv_np, success, dist_linf, dist_l2, loss_hist, queries
 
+# ---- Optimizer implementations ───────────────────────────────────────────────────────────────────────────────────────
+"""
+
+"""
+PGD_SOLVERS = ['sgd', 'sgdsign', 'adam', 'signum', 'lion', 'newton', 'adahessian']
+CURVATURE_SOLVERS = ['newton', 'adahessian']
+HESS_FLOOR = 0.1 # from ZOO's coordinate_Newton/AdaHessian functions
+
+def hutchinson_diag(hvp_fn, like, n_probes=3):
+  """Estimate the diagonal of the Hessian via Hutchinson's method.
+  diag(H) ≈ mean over random ±1 vectors z of  (z dot Hz).
+  Hessian-diagonal estimator used by the AdaHessian paper
+  (Yao et al., 2021 — arxiv.org/abs/2006.00719)
+  """
+  diag = torch.zeros_like(like)
+  for _ in range(n_probes):
+    z  = torch.randint(0, 2, like.shape, device=like.device,
+                       dtype=like.dtype) * 2 - 1     # random +/- 1 vector
+    Hz = hvp_fn(z)                                    # exact Hessian-vector product
+    diag += z * Hz
+  return diag / n_probes
+ 
+def solver_step(solver, grad, state, step_size,
+                beta1=0.9, beta2=0.999, eps=1e-8, hvp_fn=None):
+  """Return the update tensor `delta` for one step. adv ← adv - delta.
+  Reproduces the ZOO coordinate_* formulas, fed PGD's exact gradient.
+  `state`  : mutable dict carrying ZOO-equivalent buffers (mt, vt, epoch).
+  `hvp_fn` : Hessian-vector-product function, required for curvature solvers.
+  """
+  if solver == 'sgd':
+    # SGD: gradient descent. Robbins & Monro, 1951 ("A Stochastic
+    # Approximation Method", Ann. Math. Statist. 22(3)).
+    return step_size * grad
+ 
+  if solver == 'sgdsign':
+    # signSGD: Bernstein et al., 2018 ("signSGD: Compressed Optimisation
+    # for Non-Convex Problems", ICML: arxiv.org/abs/1802.04434).
+    return step_size * torch.sign(grad)
+  
+  if solver == 'adam':
+    # Adam solver defined in the ZOO paper (Chen et al., 2017, "ZOO: Zeroth Order Optimization based
+    # Black-box Attacks", AISec@CCS: arxiv.org/abs/1708.03999, doi:10.1145/3128572.3140448;
+    # "Algorithm 2: ZOO-ADAM").
+    if 'mt' not in state:
+      state['mt']    = torch.zeros_like(grad)
+      state['vt']    = torch.zeros_like(grad)
+      state['epoch'] = 1                              # ZOO adam_epoch starts at 1
+    state['mt'] = beta1 * state['mt'] + (1 - beta1) * grad
+    state['vt'] = beta2 * state['vt'] + (1 - beta2) * grad * grad
+    t    = state['epoch']
+    corr = (1 - beta2 ** t) ** 0.5 / (1 - beta1 ** t)
+    state['epoch'] += 1
+    return step_size * corr * state['mt'] / (state['vt'].sqrt() + 1e-8)
+
+  if solver == 'signum':
+    # Signum: signSGD with momentum. Bernstein et al., 2018
+    # ("signSGD with Majority Vote" / signSGD: arxiv.org/abs/1802.04434).
+    if 'mt' not in state:
+      state['mt'] = torch.zeros_like(grad)
+    state['mt'] = beta1 * state['mt'] + (1 - beta1) * grad
+    return step_size * torch.sign(state['mt'])
+
+  if solver == 'lion':
+    # Lion (EvoLved Sign Momentum: Chen et al., 2023 ("Symbolic
+    # Discovery of Optimization Algorithms": arxiv.org/abs/2302.06675).
+    if 'mt' not in state:
+      state['mt'] = torch.zeros_like(grad)
+    update = torch.sign(beta1 * state['mt'] + (1 - beta1) * grad)
+    state['mt'] = beta2 * state['mt'] + (1 - beta2) * grad   # momentum updated after the step, like ZOO
+    return step_size * update
+ 
+  if solver == 'newton':
+    # Newton's method: solver defined in the ZOO paper (Chen et al., 2017, "ZOO", AISec@CCS:
+    # arxiv.org/abs/1708.03999, doi:10.1145/3128572.3140448; the "ZOO-Newton"
+    # variant). Hessian diagonal via Hutchinson.
+    if hvp_fn is None:
+      raise ValueError("newton requires hvp_fn!")
+    hess = hutchinson_diag(hvp_fn, grad)
+    hess = torch.where(hess < 0, torch.ones_like(hess), hess)  # in zoo, neg: 1.0
+    hess = torch.clamp(hess, min=HESS_FLOOR)                   # from ZOO implementation
+    return step_size * grad / hess
+
+  if solver == 'adahessian':
+    # AdaHessian: Yao et al., 2021 ("ADAHESSIAN: An Adaptive Second Order
+    # Optimizer for Machine Learning", AAAI:  arxiv.org/abs/2006.00719).
+    if hvp_fn is None:
+      raise ValueError("adahessian requires hvp_fn!")
+    hess = hutchinson_diag(hvp_fn, grad)
+    hess = torch.where(hess < 0, torch.ones_like(hess), hess)
+    hess = torch.clamp(hess, min=HESS_FLOOR)
+    if 'mt' not in state:
+      state['mt']    = torch.zeros_like(grad)
+      state['vt']    = torch.zeros_like(grad)
+      state['epoch'] = 1
+    state['mt'] = beta1 * state['mt'] + (1 - beta1) * grad
+    state['vt'] = beta2 * state['vt'] + (1 - beta2) * hess * hess   # EMA of h^2
+    t    = state['epoch']
+    corr = (1 - beta2 ** t) ** 0.5 / (1 - beta1 ** t)
+    state['epoch'] += 1
+    return step_size * corr * state['mt'] / (state['vt'].sqrt() + 1e-8)
+ 
+  raise ValueError("unknown solver %r: choose from available solvers: %s" % (solver, PGD_SOLVERS))
+ 
 
 # Image helpers
 
@@ -200,13 +341,16 @@ def compute_metrics(orig_np, adv_np):
         ssim = float(calc_ssim(o, a, data_range=1.0, channel_axis=2))
     return {'mse': mse, 'mae': mae, 'psnr': psnr, 'ssim': ssim}
 
-
-
+# -- main ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='PGD White-Box Adversarial Attack')
     parser.add_argument('--dataset',  choices=['mnist','cifar10','imagenet'],
                         default='cifar10')
+    parser.add_argument('--solver',   choices=PGD_SOLVERS, default='sgdsign', help='Optimizer that consumes the exact ' \
+    'gradient. sgdsign (default) is classic PGD; the others let each optimizer be compared with the exact gradient ' \
+    'here vs the estimated gradient in ZOO.')
+
     parser.add_argument('--targeted', action='store_true',
                         help='Targeted attack (default: untargeted)')
     parser.add_argument('--samples',  type=int, default=10)
@@ -239,14 +383,14 @@ if __name__ == '__main__':
     use_cuda = True
     device = torch.device('cuda' if (use_cuda and torch.cuda.is_available())
                            else 'cpu')
-    print('Dataset: %s | Attack: PGD (white-box) | Targeted: %s | Device: %s' % (
-        args.dataset, args.targeted, device))
+    print('Dataset: %s | Attack: PGD (white-box) | Optimizer used as solver: %s | Targeted: %s | Device: %s' % (
+        args.dataset, args.solver, args.targeted, device))
 
     # -- Load dataset + model -------------------------------------------------
     loader, model, num_labels, label_names = load_dataset_and_model(
         args.dataset, device, args.imagenet_dir)
 
-    # -- Filter to correctly-classified samples ----------
+    # -- Filter to correctly-classified samples -------------------------------
     print('Checking model accuracy on test set...')
     all_inputs, all_labels = [], []
     for img, lbl in loader:
@@ -279,9 +423,9 @@ if __name__ == '__main__':
     print('Attack samples selected: %d' % len(inputs))
 
     # -- Output directory -----------------------------------------------------
-    # <dataset>/<targeted|untargeted>/pgd/
+    # <dataset>/<targeted|untargeted>/pgd_<solver>/
     targeted_str = 'targeted' if args.targeted else 'untargeted'
-    out_dir = os.path.join(args.dataset, targeted_str, 'pgd')
+    out_dir = os.path.join(args.dataset, targeted_str, 'pgd_' + args.solver)
     os.makedirs(out_dir, exist_ok=True)
 
     # -- Run attacks ----------------------------------------------------------
@@ -301,6 +445,7 @@ if __name__ == '__main__':
             epsilon   = args.epsilon,
             step_size = args.step_size,
             max_iter  = args.max_iter,
+            solver    = args.solver,
         )
         queries_list.append(queries)
 
@@ -348,12 +493,13 @@ if __name__ == '__main__':
     mean_l2_on_success   = float(np.mean(succ_l2))   if succ_l2   else float('nan')
 
     print('\n' + '='*60)
-    print('Attack       : PGD (white-box, first-order baseline)')
+    print('Attack : PGD (white-box, first-order baseline)')
+    print('Optimizer used as solver : %s' % args.solver)
     print('Success Rate : %.1f %%' % success_rate)
     print('Queries (avg on success) : %.1f' % mean_queries)
     print('L-inf dist (avg on success): %.4f' % mean_linf_on_success)
     print('L2 dist    (avg on success): %.4f' % mean_l2_on_success)
-    print('Time         : %.2f mins for %d samples' % (elapsed, len(inputs)))
+    print('Time : %.2f mins for %d samples' % (elapsed, len(inputs)))
     print('='*60)
 
     # -- Save results.json ----------------------------------------------------
@@ -361,7 +507,7 @@ if __name__ == '__main__':
         'dataset':                    args.dataset,
         'attack':                     'pgd',
         'targeted':                   args.targeted,
-        'solver':                     'pgd_exact_gradient',
+        'solver':                     args.solver,
         'num_samples':                len(inputs),
         'success_rate_pct':           success_rate,
         'total_distortion':           total_distortion_l2,   # L2 to match ZOO
@@ -370,8 +516,7 @@ if __name__ == '__main__':
         'queries': {
             'per_sample':             queries_list,
             'mean_on_success':        mean_queries,
-            'counting_convention':    '3 per PGD iter (1 fwd loss + 1 bwd grad '
-                                      '+ 1 fwd success-check)',
+            'counting_convention':    '3 per PGD iter (1 fwd loss + 1 bwd grad + 1 fwd success-check)',
         },
         'distortion': {
             'linf_per_sample':        linf_list,
@@ -397,9 +542,7 @@ if __name__ == '__main__':
     print('Results saved to %s' % results_path)
 
     # -- grid visualisation ------------
-    import matplotlib
     matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
 
     if args.dataset == 'imagenet':
         label_fn = lambda idx: (label_names[int(idx)][:12]
@@ -422,7 +565,6 @@ if __name__ == '__main__':
         else:
             plt.imshow(img)
     plt.tight_layout()
-    grid_path = os.path.join(out_dir, 'grid_%s_%s_pgd.png' % (
-        args.dataset, targeted_str))
+    grid_path = os.path.join(out_dir, 'grid_%s_%s_pgd_%s.png' % (args.dataset, targeted_str, args.solver))
     plt.savefig(grid_path, dpi=120)
     print('Grid saved to %s' % grid_path)
