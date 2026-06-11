@@ -2,3 +2,17 @@ data/
 graphs/
 cifar10/
 mnist/
+
+
+__pycache__/*
+cifar10-early/
+imagenet/
+mnist-early/
+nes_attack.py
+nes_results_runs/
+plots/
+run_logs/
+scripts/
+
+*.csv
+*.sh
