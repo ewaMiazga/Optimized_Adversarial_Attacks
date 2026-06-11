@@ -22,3 +22,4 @@ __pycache__/setup_mnist_model.cpython-39.pyc
 *csv
 scripts
 *.sh
+nes_attack.py

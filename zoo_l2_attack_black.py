@@ -14,7 +14,22 @@ from skimage.metrics import peak_signal_noise_ratio as calc_psnr
 from skimage.metrics import structural_similarity as calc_ssim
 from setup_mnist_model import MNIST
 from setup_cifar10_model import CIFAR10
-from setup_imagenet_model import VGG16Wrapper, imagenet_transform, get_imagenet_labels
+from setup_imagenet_model import get_imagenet_labels
+
+# ImageNette synset folders mapped to true ImageNet class IDs.
+IMAGENETTE_TO_IMAGENET = {
+  'n01440764': 0,    # tench
+  'n02102040': 217,  # English springer
+  'n02979186': 482,  # cassette player
+  'n03000684': 491,  # chain saw
+  'n03028079': 497,  # church
+  'n03394916': 566,  # French horn
+  'n03417042': 569,  # garbage truck
+  'n03425413': 571,  # gas pump
+  'n03445777': 574,  # golf ball
+  'n03888257': 701,  # parachute
+}
+IMAGENETTE_LABEL_IDS = list(IMAGENETTE_TO_IMAGENET.values())
 
 """##L2 Black Box Attack"""
 
@@ -167,9 +182,10 @@ def loss_run(input,target,model,modifier,use_tanh,use_log,targeted,confidence,co
   # losses/l2/loss2 stay on GPU (consumed by solvers); scores+pert_images go to CPU for output
   return loss.detach(), l2.detach(), loss2.detach(), output.detach().cpu().numpy(), pert_out.detach().cpu().numpy()
 
-def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device='cpu', reset_adam_after_found=True,abort_early=True,
+# batch size = 128
+def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device='cpu', reset_adam_after_found=True,
               batch_size=128,max_iter=1000,const=0.01,confidence=0.0,early_stop_iters=100, binary_search_steps=9,
-              step_size=0.01,adam_beta1=0.9,adam_beta2=0.999):
+              step_size=0.01,adam_beta1=0.9,adam_beta2=0.999, early_stop=False):
   
   early_stop_iters = early_stop_iters if early_stop_iters != 0 else max_iter // 10
 
@@ -187,10 +203,11 @@ def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device=
 
   upper_bound=1e10
   lower_bound=0.0
-  out_best_attack=input.clone().detach().cpu().numpy()
+  out_best_attack=input.clone().detach().cpu().numpy()[0]
   out_best_const=const  
   out_bestl2=1e10
   out_bestscore=-1
+  query_count = 0
   
 
   if use_tanh:
@@ -227,6 +244,7 @@ def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device=
     for iter in range(max_iter):
       if (iter+1)%100 == 0:
         loss, l2, loss2, _ , __ = loss_run(input,target,model,real_modifier,use_tanh,use_log,targeted,confidence,const,device)
+        query_count += 1
         print("[STATS][L2] iter = {}, loss = {:.5f}, loss1 = {:.5f}, loss2 = {:.5f}".format(iter+1, loss[0].item(), l2[0].item(), loss2[0].item()))
         sys.stdout.flush()
 
@@ -241,6 +259,7 @@ def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device=
       flat_var[neg_idx, indice] -= 0.0001
 
       losses, l2s, losses2, scores, pert_images = loss_run(input,target,model,var,use_tanh,use_log,targeted,confidence,const,device)
+      query_count += (batch_size * 2 + 1)
 
       # Solver updates real_modifier in-place — everything stays on GPU
       if solver=="adam":
@@ -268,7 +287,7 @@ def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device=
       last_loss2=loss2_val
 
       loss_val = losses[0].item()
-      if abort_early and (iter+1) % early_stop_iters == 0:
+      if (iter+1) % early_stop_iters == 0:
         if loss_val > prev*.9999:
             print("Early stopping because there is no improvement")
             break
@@ -288,6 +307,8 @@ def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device=
         out_bestscore = np.argmax(scores[0])
         out_best_attack = pert_images[0]
         out_best_const = const
+        if early_stop:
+          return out_best_attack, out_bestscore, int(query_count)
   
     if compare(bestscore, np.argmax(target.detach().cpu().numpy(),-1)) and bestscore != -1:
       print('old constant: ', const)
@@ -304,9 +325,9 @@ def l2_attack(input, target, model, targeted, use_log, use_tanh, solver, device=
           const *= 10
       print('new constant: ', const)
 
-  return out_best_attack, out_bestscore
+  return out_best_attack, out_bestscore, int(query_count)
 
-def generate_data(test_loader, targeted, samples, start, num_label=10):
+def generate_data(test_loader, targeted, samples, start, num_label=10, targeted_k=None):
   inputs=[]
   targets=[]
   cnt=0
@@ -316,6 +337,11 @@ def generate_data(test_loader, targeted, samples, start, num_label=10):
         data, label = data[0],data[1]
         if targeted:
           seq = range(num_label)
+          if targeted_k is not None:
+            rng = np.random.RandomState(42 + i)
+            candidates = [j for j in seq if j != label.item()]
+            k = max(1, min(int(targeted_k), len(candidates)))
+            seq = rng.choice(candidates, size=k, replace=False).tolist()
           for j in seq:
             if j==label.item():
               continue
@@ -335,22 +361,59 @@ def generate_data(test_loader, targeted, samples, start, num_label=10):
 
   return inputs,targets
 
-def attack(inputs, targets, model, targeted, use_log, use_tanh, solver, device, step_size=0.01):
+
+def select_one_per_label(data_arr, label_arr, required_labels, start=0):
+  """
+  Select one sample per required label, preserving `required_labels` order.
+  Returns (selected_data, selected_labels, missing_labels).
+  """
+  first_idx = {}
+  req = set(required_labels)
+  start_idx = max(int(start), 0)
+
+  for i in range(start_idx, len(label_arr)):
+    lbl = int(label_arr[i])
+    if lbl in req and lbl not in first_idx:
+      first_idx[lbl] = i
+      if len(first_idx) == len(required_labels):
+        break
+
+  chosen_labels = [lbl for lbl in required_labels if lbl in first_idx]
+  missing = [lbl for lbl in required_labels if lbl not in first_idx]
+
+  if not chosen_labels:
+    return np.empty((0, *data_arr.shape[1:]), dtype=data_arr.dtype), np.empty((0,), dtype=label_arr.dtype), missing
+
+  idxs = [first_idx[lbl] for lbl in chosen_labels]
+  return data_arr[idxs], label_arr[idxs], missing
+
+def attack(inputs, targets, model, targeted, use_log, use_tanh, solver, device,
+           step_size=0.01, batch_size=128, max_iter=1000,
+           const=0.01, confidence=0.0, early_stop_iters=100, binary_search_steps=9,
+           adam_beta1=0.9, adam_beta2=0.999, early_stop=False):
   r = []
+  queries = []
   print('go up to',len(inputs))
   # run 1 image at a time, minibatches used for gradient evaluation
   for i in range(len(inputs)):
     print('tick',i+1)
-    attack,score=l2_attack(np.expand_dims(inputs[i],0), np.expand_dims(targets[i],0), model, targeted, use_log, use_tanh, solver, device=device, step_size=step_size)
-    r.append(attack)
-  return np.array(r)
+    attack_img, score, q = l2_attack(
+      np.expand_dims(inputs[i],0), np.expand_dims(targets[i],0), model,
+      targeted, use_log, use_tanh, solver, device=device,
+      batch_size=batch_size, max_iter=max_iter,
+      const=const, confidence=confidence, early_stop_iters=early_stop_iters,
+      binary_search_steps=binary_search_steps, step_size=step_size,
+      adam_beta1=adam_beta1, adam_beta2=adam_beta2, early_stop=early_stop)
+    r.append(attack_img)
+    queries.append(int(q))
+  return np.array(r), queries
 
 if __name__=='__main__':
   parser = argparse.ArgumentParser(description="ZOO L2 Black-Box Adversarial Attack")
   parser.add_argument("--dataset",  choices=["mnist", "cifar10", "imagenet"], default="cifar10",
                       help="Dataset to attack (default: cifar10)")
   parser.add_argument("--solver",   choices=["adam", "newton", "sgd", "sgdsign", "signum", "lion", "adahessian"],
-                      default="newton", help="Coordinate-descent solver (default: newton)")
+                      default="adam", help="Coordinate-descent solver (default: adam)")
   parser.add_argument("--targeted", action="store_true",
                       help="Run a targeted attack (default: untargeted)")
   parser.add_argument("--samples",  type=int, default=10,
@@ -359,6 +422,28 @@ if __name__=='__main__':
                       help="Offset into the test set (default: 6)")
   parser.add_argument("--imagenet_dir", default=None,
                       help="Path to ImageNet val directory (required when --dataset imagenet)")
+  parser.add_argument("--targeted-k", type=int, default=None,
+                      help="In targeted mode, use at most K random target classes per source image")
+  parser.add_argument("--batch-size", type=int, default=128,
+                      help="Coordinates per optimization step (default: 128)")
+  parser.add_argument("--max-iter", type=int, default=1000,
+                      help="Max iterations per binary-search stage (default: 1000)")
+  parser.add_argument("--const", type=float, default=0.01,
+                      help="Initial attack trade-off constant (default: 0.01)")
+  parser.add_argument("--confidence", type=float, default=0.0,
+                      help="CW confidence margin (default: 0.0)")
+  parser.add_argument("--early-stop-iters", type=int, default=100,
+                      help="Abort check cadence (default: 100)")
+  parser.add_argument("--binary-search-steps", type=int, default=9,
+                      help="Binary search steps over const (default: 9)")
+  parser.add_argument("--adam-beta1", type=float, default=0.9,
+                      help="Optimizer beta1 (default: 0.9)")
+  parser.add_argument("--adam-beta2", type=float, default=0.999,
+                      help="Optimizer beta2 (default: 0.999)")
+  parser.add_argument("--step-size", type=float, default=None,
+                      help="Override the solver's default coordinate step size")
+  parser.add_argument("--early-stop", action="store_true",
+                      help="Enable early stopping based on attack success (default: false)")
   args = parser.parse_args()
 
   np.random.seed(42)
@@ -372,21 +457,79 @@ if __name__=='__main__':
   device   = torch.device("cuda" if (use_cuda and torch.cuda.is_available()) else "cpu")
   print(f"Dataset: {dataset_name} | Solver: {solver} | Targeted: {targeted} | Device: {device}")
 
-  transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (1.0,))])
+  transform_gray = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (1.0,))])
+  transform_rgb = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,0.5,0.5), (1.0,1.0,1.0))])
   if dataset_name == "mnist":
-    test_set = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+    test_set = datasets.MNIST(root='./data', train=False, transform=transform_gray, download=True)
     model = MNIST().to(device)
     model.load_state_dict(torch.load('./models/mnist_model.pt', map_location=device, weights_only=False))
     num_label = 10
   elif dataset_name == "imagenet":
-    if args.imagenet_dir is None:
-      raise ValueError("--imagenet_dir is required when --dataset imagenet")
+    from torchvision import models
     from torchvision.datasets import ImageFolder
-    test_set = ImageFolder(root=args.imagenet_dir, transform=imagenet_transform())
-    model = VGG16Wrapper(pretrained=True).to(device)
+
+    val_dir = args.imagenet_dir if args.imagenet_dir is not None else os.path.join('data', 'imagenette2-320', 'val')
+    if not os.path.isdir(val_dir):
+      import urllib.request, tarfile
+      os.makedirs('data', exist_ok=True)
+      archive = os.path.join('data', 'imagenette2-320.tgz')
+      if not os.path.exists(archive):
+        print('ImageNette not found, downloading (~100 MB)...')
+        urllib.request.urlretrieve(
+          'https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-320.tgz',
+          archive,
+          reporthook=lambda b, bs, t: print(
+            '\r  %.1f/%.1f MB' % (b * bs / 1e6, t / 1e6), end='', flush=True))
+        print()
+      print('Extracting...')
+      with tarfile.open(archive, 'r:gz') as tar:
+        tar.extractall('data')
+      os.remove(archive)
+      print('ImageNette ready.')
+
+      val_dir = os.path.join('data', 'imagenette2-320', 'val')
+      if not os.path.isdir(val_dir):
+        raise ValueError("ImageNette validation directory not found after extraction: %s" % val_dir)
+
+    img_transform = transforms.Compose([
+      transforms.Resize((299, 299)),
+      transforms.ToTensor(),
+      transforms.Normalize((0.5, 0.5, 0.5), (1.0, 1.0, 1.0)),
+    ])
+
+    class _ImageNetteDataset(ImageFolder):
+      """ImageFolder with true ImageNet class IDs from synset folder names."""
+      def __getitem__(self, idx):
+        img, folder_idx = super().__getitem__(idx)
+        synset = self.classes[folder_idx]
+        label = IMAGENETTE_TO_IMAGENET.get(synset, 0)
+        return img, label
+
+    test_set = _ImageNetteDataset(val_dir, transform=img_transform)
+
+    inception = models.inception_v3(weights=models.Inception_V3_Weights.IMAGENET1K_V1)
+    inception.aux_logits = False
+
+    class _InceptionWrapper(torch.nn.Module):
+      """Accepts [-0.5,0.5] input, applies ImageNet normalisation inside."""
+      _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+      _STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+      def __init__(self, base):
+        super().__init__()
+        self.base = base
+
+      def forward(self, x):
+        x = x + 0.5
+        mean = self._MEAN.to(x.device, x.dtype)
+        std = self._STD.to(x.device, x.dtype)
+        x = (x - mean) / std
+        return self.base(x)
+
+    model = _InceptionWrapper(inception).to(device)
     num_label = 1000
   else:
-    test_set = datasets.CIFAR10(root='./data', train=False, transform=transform, download=True)
+    test_set = datasets.CIFAR10(root='./data', train=False, transform=transform_rgb, download=True)
     model = CIFAR10().to(device)
     model.load_state_dict(torch.load('./models/cifar10_model.pt', map_location=device, weights_only=False))
     num_label = 10
@@ -401,9 +544,10 @@ if __name__=='__main__':
   ADAM_LR    = 0.01
   NEWTON_LR  = 0.01
   SGD_LR     = 0.01
-  SGDSIGN_LR = 0.001
-  SIGNUM_LR  = 0.001
-  LION_LR       = 0.001
+  SGDSIGN_LR = 0.015
+  SIGNUM_LR  = 0.015
+  # cifar10 - 0.01
+  LION_LR       = 0.015
   ADAHESSIAN_LR = 0.01
 
   lr_map = {
@@ -415,36 +559,88 @@ if __name__=='__main__':
       "lion":       LION_LR,
       "adahessian": ADAHESSIAN_LR,
   }
-  step_size = lr_map[solver]
+  step_size = args.step_size if args.step_size is not None else lr_map[solver]
+
   # ─────────────────────────────────────────────────────────────────────────
 
   #start is a offset to start taking sample from test set
   #samples is the how many samples to take in total : for targeted, 1 means all 9 class target -> 9 total samples whereas for untargeted the original data 
   #sample is taken i.e. 1 sample only 
   
-  # check the accuracy of the model on the orginal samples 
-  data, label = generate_data(test_loader,targeted=False,samples=len(test_loader),start=args.start,num_label=num_label)
-  pred = model(torch.from_numpy(data).to(device))
-  pred = torch.argmax(pred,dim=-1).cpu().numpy()
-  label = np.argmax(label,axis=-1)
-  acc = (pred==label).sum()/len(pred)
-  print("Model accuracy on original samples: ", acc*100.0, "%")
-  # per class classification accuracy
-  print("labels: ", label)
-  for i in range(10):
-    idx = label==i
-    acc = (pred[idx]==label[idx]).sum()/idx.sum()
-    print("Class {} accuracy: {:.2f}%".format(i, acc*100.0))
+  # Collect correctly-classified source images.
+  # For untargeted ImageNet, we need enough coverage to pick one sample
+  # from each ImageNette class.
+  use_imagenette_one_per_class = (dataset_name == "imagenet" and not targeted)
+  needed_correct = None if use_imagenette_one_per_class else (args.start + args.samples + 1)
+  data_correct = []
+  label_correct = []
+  scanned = 0
+  scanned_correct = 0
+  with torch.no_grad():
+    for img, lbl in test_loader:
+      scanned += 1
+      img_dev = img.to(device)
+      lbl_int = int(lbl.item())
+      pred = int(model(img_dev).argmax(dim=1).item())
+      if pred == lbl_int:
+        scanned_correct += 1
+        data_correct.append(img[0].numpy())
+        label_correct.append(lbl_int)
+        if needed_correct is not None and len(data_correct) >= needed_correct:
+          break
 
-  # exclude the missclassifed samples from the attack evaluation
-  data = data[pred==label]
-  label = label[pred==label]
-  print("Number of correctly classified samples: ", len(data))
-  test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(torch.from_numpy(data), torch.from_numpy(label)), batch_size=1, shuffle=False)
+  acc_subset = (scanned_correct / max(scanned, 1)) * 100.0
+  print("Model accuracy on scanned subset: %.2f%% (%d/%d)" % (acc_subset, scanned_correct, scanned))
+  print("Number of correctly classified samples collected:", len(data_correct))
+  if needed_correct is not None and len(data_correct) < needed_correct:
+    raise RuntimeError(
+      "Not enough correctly classified samples collected (%d < %d). "
+      "Lower --start/--samples or provide more data." % (len(data_correct), needed_correct)
+    )
 
-  inputs, targets = generate_data(test_loader,targeted,samples=args.samples,start=args.start,num_label=num_label)
+  if use_imagenette_one_per_class:
+    selected_data, selected_labels, missing = select_one_per_label(
+      np.array(data_correct, dtype=np.float32),
+      np.array(label_correct, dtype=np.int64),
+      IMAGENETTE_LABEL_IDS,
+      start=args.start,
+    )
+    if missing:
+      raise RuntimeError(
+        "Could not find correctly-classified samples for labels: %s" % missing
+      )
+
+    print('Auto-enabling class-balanced ImageNette sources for untargeted ImageNet.')
+    print('Using class-balanced ImageNette sources (10 classes, 1 sample each).')
+    print('Selected labels: %s' % selected_labels.tolist())
+    data_correct = selected_data.tolist()
+    label_correct = selected_labels.tolist()
+    args.samples = len(selected_data)
+    args.start = -1
+
+  data = np.array(data_correct, dtype=np.float32)
+  label = np.array(label_correct, dtype=np.int64)
+  test_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(torch.from_numpy(data), torch.from_numpy(label)),
+    batch_size=1, shuffle=False)
+
+  inputs, targets = generate_data(
+    test_loader, targeted, samples=args.samples, start=args.start,
+    num_label=num_label, targeted_k=args.targeted_k)
   timestart = time.time()
-  adv = attack(inputs, targets, model, targeted, use_log, use_tanh, solver, device, step_size=step_size)
+  adv, queries_list = attack(
+    inputs, targets, model, targeted, use_log, use_tanh, solver, device,
+    step_size=step_size,
+    batch_size=args.batch_size,
+    max_iter=args.max_iter,
+    const=args.const,
+    confidence=args.confidence,
+    early_stop_iters=args.early_stop_iters,
+    binary_search_steps=args.binary_search_steps,
+    adam_beta1=args.adam_beta1,
+    adam_beta2=args.adam_beta2,
+    early_stop=args.early_stop
+  )
   timeend = time.time()
   print("Took",(timeend-timestart)/60.0,"mins to run",len(inputs),"samples.")
 
@@ -455,8 +651,14 @@ if __name__=='__main__':
     valid_class = np.argmax(model(torch.from_numpy(inputs).to(device)).detach().cpu().numpy(), -1)
     adv_class   = np.argmax(model(torch.from_numpy(adv).to(device)).detach().cpu().numpy(), -1)
 
-  acc              = ((valid_class == adv_class).sum()) / len(inputs)
-  success_rate     = (1.0 - acc) * 100.0
+  if targeted:
+    target_class = np.argmax(targets, axis=-1)
+    success_mask = (adv_class == target_class)
+  else:
+    success_mask = (valid_class != adv_class)
+  success_rate     = float(success_mask.mean() * 100.0)
+  successful_queries = [queries_list[i] for i in range(len(success_mask)) if success_mask[i]]
+  mean_queries = float(np.mean(successful_queries)) if successful_queries else float('nan')
   # total change depends on input size (L2)
   total_distortion = float(np.sum((adv - inputs) ** 2) ** 0.5)
   elapsed_mins     = (timeend - timestart) / 60.0
@@ -517,8 +719,25 @@ if __name__=='__main__':
       "success_rate_pct":           success_rate,
       "total_distortion":           total_distortion,
       "time_mins":                  elapsed_mins,
+        "queries": {
+          "per_sample":             queries_list,
+          "mean_on_success":        mean_queries,
+          "budget":                 int(args.binary_search_steps * args.max_iter * (2 * args.batch_size + 1))
+        },
       "valid_classification":       valid_class.tolist(),
       "adversarial_classification": adv_class.tolist(),
+        "attack_params": {
+          "batch_size":             args.batch_size,
+          "max_iter":               args.max_iter,
+          "const":                  args.const,
+          "confidence":             args.confidence,
+          "binary_search_steps":    args.binary_search_steps,
+          "early_stop_iters":       args.early_stop_iters,
+          "adam_beta1":             args.adam_beta1,
+          "adam_beta2":             args.adam_beta2,
+            "step_size":              step_size,
+          "targeted_k":             args.targeted_k,
+        },
       "mse": {
           "mean:"       : float(np.mean(mse_list)),
           "per_sample":  mse_list
