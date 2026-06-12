@@ -164,6 +164,13 @@ python opt_visualization.py
 
 Switch the target function, starting point, and per-solver learning rates via the settings at the bottom of the file. A companion script, `grad_est_optimization.py`, runs the same optimizers on the same functions but contrasts exact analytical gradients against finite-difference estimates, so how gradient noise reshapes each optimizer's path can be observed.
 
+Example visualizations:
+<p align="center">
+  <img src="vis_assets/image1.jpeg" width="30%" />
+  <img src="vis_assets/image2.jpeg" width="30%" />
+  <img src="vis_assets/image3.jpeg" width="30%" />
+</p>
+
 ---
 
 ## Sample results
@@ -172,4 +179,4 @@ Every run writes a labelled grid image (`grid_<dataset>_<mode>_<solver>.png`) in
 
 CIFAR-10, Adam (untargeted):
 
-![CIFAR-10 adversarial examples — Adam, untargeted](sample_results/adam_untargeted_cifar10.png)
+![CIFAR-10 adversarial examples — Adam, untargeted](sample_results/grid_cifar10_targeted_adam.png)
