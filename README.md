@@ -1,6 +1,6 @@
 # ZOO Black-Box Adversarial Attack
 
-Implementation of the ZOO (Zeroth Order Optimization) black-box adversarial attack from [Chen et al., 2017](https://arxiv.org/abs/1708.03999), supporting MNIST, CIFAR-10, and ImageNet with multiple coordinate-descent solvers. Forked from the paper's repository.
+Implementation of the ZOO (Zeroth Order Optimization) black-box adversarial attack from [Chen et al., 2017](https://arxiv.org/abs/1708.03999), supporting MNIST, CIFAR-10, and ImageNet with multiple coordinate-descent solvers. Forked from the pyTorch implementation following paper's repository.
 
 ---
 
