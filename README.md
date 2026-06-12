@@ -26,7 +26,7 @@ The results reported in the paper come from sweeping every solver across every m
 python run.py   # all solvers, all models, both untargeted + targeted
 ```
 
-`run.py` calls the attack below once per (dataset, solver, mode) combination and writes each run's output to its own folder. Restrict the sweep with `--modes untargeted` or `--modes targeted`, narrow it with `--datasets` / `--solvers` / `--samples`, or pass `--dry-run` to preview the commands first.
+`run.py` calls the attack below once per (dataset, solver, mode) combination and writes each run's output to its own folder (see [Results](#results)). Restrict the sweep with `--modes untargeted` or `--modes targeted`, narrow it with `--datasets` / `--solvers` / `--samples`, or pass `--dry-run` to preview the commands first.
 
 ### Basic usage
 
@@ -79,7 +79,7 @@ The attack always stops as soon as the adversarial example successfully fools th
 |---|---|---|
 | `--dataset` | `cifar10` | `mnist`, `cifar10`, or `imagenet` |
 | `--solver` | `sgdsign` | `sgd`, `sgdsign`, `adam`, `signum`, `lion`, `newton`, `adahessian` (`sgdsign` is classic PGD) |
-| `--samples` | `10` | Number of **source** images. Untargeted: N attacks. Targeted: each source is attacked toward every other class, so for 10-class MNIST/CIFAR-10 that's N × 9 (e.g. 10 → 90 attacks) |
+| `--samples` | `10` | Number of source images. Untargeted: N attacks. Targeted: each source is attacked toward every other class, so for 10-class MNIST/CIFAR-10 that's N × 9 (e.g. 10 → 90 attacks) |
 | `--start` | `6` | Offset into the test set (same as ZOO / NES) |
 | `--targeted` | `False` | Targeted attack (default: untargeted) |
 | `--targeted-k` | `None` | Number of non-true target classes per source image in targeted mode |
@@ -109,10 +109,10 @@ Results are saved in `<dataset>/<targeted|untargeted>/pgd_<solver>/`:
 ```
 cifar10/
   untargeted/pgd_sgdsign/
-    results.json               ← success rate, queries, distortion, PSNR, SSIM, time
-    original_0.png             ← original image
-    adversarial_0.png          ← adversarial image
-    grid_cifar10_untargeted_pgd_sgdsign.png  ← side-by-side grid with class labels
+    results.json               : success rate, queries, distortion, PSNR, SSIM, time
+    original_0.png             : original image
+    adversarial_0.png          : adversarial image
+    grid_cifar10_untargeted_pgd_sgdsign.png  : side-by-side grid with class labels
 ```
 
 `results.json` includes a `queries` block:
@@ -126,3 +126,25 @@ cifar10/
 ```
 
 along with `success_rate_pct`, `total_distortion`, `time_mins`, a `distortion` block (per-sample and mean L-inf / L2 on success), the per-sample `mse`, `mae`, `psnr`, and `ssim` blocks, and an `attack_params` block recording `epsilon`, `step_size`, and `max_iter`.
+
+---
+
+## Optimizer intuition
+
+We deliver `opt_visualization.py` for gaining intuition behind the optimizers' behaviour, independent of the attack setting. It minimises classic 2-D test functions — Rosenbrock, Himmelblau, Beale, and Sphere — with the same optimizer family used in the attacks (Adam, Newton, SGD, SignSGD, Signum, Lion), recording each optimizer's trajectory and plotting it over a filled 2-D contour and a 3-D surface, plus a convergence curve.
+
+```bash
+python opt_visualization.py
+```
+
+Switch the target function, starting point, and per-solver learning rates via the settings at the bottom of the file. A companion script, `grad_est_optimization.py`, runs the same optimizers on the same functions but contrasts exact analytical gradients against finite-difference estimates — the same estimation that black-box ZOO/NES rely on — so you can see how gradient noise reshapes each optimizer's path.
+
+---
+
+## Sample results
+
+Every run writes a labelled grid image (`grid_<dataset>_<mode>_pgd_<solver>.png`) into its output folder, showing each source image with its `original → adversarial` prediction. A few precomputed examples are committed under [`sample_results/`](sample_results), so you can see what the attack produces without running anything.
+
+CIFAR-10, Adam (targeted):
+
+![CIFAR-10 adversarial examples — Adam, targeted](sample_results/grid_cifar10_targeted_pgd_adam.png)
