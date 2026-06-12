@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 data/
+mnist*
+cifar*
+imagenet*
 imagenet_experiment_setup.tex
 imagenet_inception_refs.bib
 models/__pycache__/
@@ -13,3 +16,11 @@ run_imagenet_untargeted.sh
 run_logs/
 run_targeted_all.sh
 scripts/
+
+__pycache__/setup_cifar10_model.cpython-39.pyc
+__pycache__/setup_mnist_model.cpython-39.pyc
+*csv
+scripts
+*.sh
+nes_attack.py
+*.zip
