@@ -154,8 +154,7 @@ The summary compares MNIST and CIFAR-10 (matching the report figure); it needs b
 
 ## Sample results
 
-Every run writes a labelled grid image (`grid_<dataset>_<mode>_<solver>.png`) into `nes_results/<dataset>/<targeted|untargeted>/<solver>/`, showing each source image with its `original → adversarial` prediction — open one to see the results visually. To showcase examples directly in this README, drop a few of those grids into a `sample_results/` folder and reference them here, e.g.:
+Every run writes a labelled grid image (`grid_<dataset>_<mode>_<solver>.png`) into `nes_results/<dataset>/<targeted|untargeted>/<solver>/`, showing each source image with its `original → adversarial` prediction — open one to see the results visually. To showcase examples directly in this README, drop a few of those grids into a `sample_results/` folder and reference them here, e.g. for CIFAR10, Adam, targeted:
 
-```markdown
-![CIFAR-10 adversarial examples — Adam, untargeted](sample_results/adam_untargeted_cifar10.png)
-```
+![CIFAR-10 adversarial examples — Adam, targeted](sample_results/grid_cifar10_targeted_adam.png)
+
