@@ -20,6 +20,17 @@ python setup.py
 
 ## Running attacks
 
+### Reproducing the paper results
+
+The results reported in the paper come from sweeping every solver across every model, both untargeted and targeted. A single call runs the whole sweep:
+
+```bash
+python run.py                  # all solvers, all models, BOTH untargeted + targeted
+```
+
+`run.py` calls the attack below once per (dataset, solver, mode) combination and writes each run's output to its own folder (see [Results](#results)). It also renders the targeted-vs-untargeted summary graph (see [Plots](#plots)) at the end; add `--plot-only` to regenerate just the graph without re-running the attacks. Restrict the sweep with `--modes untargeted` or `--modes targeted`, narrow it with `--datasets` / `--solvers` / `--samples`, or pass `--dry-run` to preview the commands first.
+
+
 ### Basic usage
 
 ```bash
@@ -105,10 +116,10 @@ Results are saved in `nes_results/<dataset>/<targeted|untargeted>/<solver>/`:
 ```
 nes_results/
   mnist/untargeted/lion/
-    results.json               ← success rate, queries, distortion, PSNR, SSIM, time
-    original_0.png             ← original image
-    adversarial_0.png          ← adversarial image
-    grid_mnist_untargeted_lion.png  ← side-by-side grid with class labels
+    results.json               : success rate, queries, distortion, PSNR, SSIM, time
+    original_0.png             : original image
+    adversarial_0.png          : adversarial image
+    grid_mnist_untargeted_lion.png  : side-by-side grid with class labels
 ```
 
 `results.json` includes a `queries` block:
@@ -119,4 +130,32 @@ nes_results/
   "mean_on_success": 1050.0,
   "budget": 50000
 }
+```
+---
+## Plots
+
+The targeted-vs-untargeted summary (report Fig. 4) is produced by `plot_targeted_vs_untargeted_summary.py`, which plots two diagonal comparisons across optimizers: total L2 distortion (untargeted vs targeted) and mean queries on success (untargeted vs targeted). It reads `total_distortion` and `queries.mean_on_success` from each `nes_results/<dataset>/<targeted|untargeted>/<solver>/results.json` (override the root with `--results-dir`), and writes the figure to `plots/`.
+
+`run.py` renders this graph automatically after the sweep finishes. To regenerate it without re-running the attacks (e.g. to test plot generation), use `--plot-only`:
+
+```bash
+python run.py --plot-only
+```
+
+You can also call the plot script directly, e.g. to drop solvers from the figure:
+
+```bash
+python plot_targeted_vs_untargeted_summary.py --exclude-solvers newton adahessian
+```
+
+The summary compares MNIST and CIFAR-10 (matching the report figure); it needs both the untargeted and targeted runs present for each optimizer, which a default `run.py` sweep produces.
+
+---
+
+## Sample results
+
+Every run writes a labelled grid image (`grid_<dataset>_<mode>_<solver>.png`) into `nes_results/<dataset>/<targeted|untargeted>/<solver>/`, showing each source image with its `original → adversarial` prediction — open one to see the results visually. To showcase examples directly in this README, drop a few of those grids into a `sample_results/` folder and reference them here, e.g.:
+
+```markdown
+![CIFAR-10 adversarial examples — Adam, untargeted](sample_results/adam_untargeted_cifar10.png)
 ```
